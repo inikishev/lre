@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lre"
+version = "1.0.0"
+requires-python = ">=3.10"
+dependencies = [
+  "torch",
+]
+
+# [tool.setuptools]
+# packages = ["visualbench"]
+
+[tool.setuptools.packages]
+find = {}  # Scanning implicit namespaces is active by default
