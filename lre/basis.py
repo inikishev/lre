@@ -3,7 +3,7 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
-
+import numpy as np
 import torch
 
 from .linalg import (
@@ -717,7 +717,7 @@ class HebbianLearning(Basis):
         return Q, Q, None, None
 
 
-class RandomBasis(Basis):
+class Random(Basis):
     """random basis"""
     def __init__(self, rank=100, generate_freq:int=1):
         super().__init__()
@@ -732,7 +732,7 @@ class RandomBasis(Basis):
 
         return self.Q, self.Q, None, None
 
-class FullMatrixBasis(Basis):
+class FullMatrix(Basis):
     """Full-matrix basis. Stores full matrix and computes eigendecomposition on each update"""
 
     def __init__(
@@ -772,3 +772,154 @@ class FullMatrixBasis(Basis):
         L, Q = regularize_eigh(L, Q, truncate=self.truncate, tol=self.eig_tol, damping=self.damping, rdamping=self.rdamping)
 
         return Q, Q, L, L
+
+
+class TopK(Basis):
+    """returns a (truncated) permutation matrix with top rank elements in the correction, disregarding all other info. If ``beta`` is used, it has to be re-orthogonalized via QR"""
+    def __init__(
+        self,
+        topk: int = 100,
+        beta: float | None = 0.99,
+        stable: bool = False,
+        ortho_method: OrthoMethod = 'qr',
+        track_ortho: bool = False,
+    ):
+        super().__init__()
+        self.topk = topk
+        self.beta = beta
+        self.stable = stable
+        self.ortho_method: OrthoMethod = ortho_method
+        self.track_ortho = track_ortho
+        self.P = None
+
+    def update(self, Y, Z, alpha):
+        assert Z is None, "TopKPermutationBasis only works on symmetric matrices, set `symmetrize=True` in LRE"
+
+        v = Y.mean(1)
+        topk = min(self.topk, v.numel())
+
+        if self.stable:
+            vals, argsort = torch.sort(v.abs(), descending=True, stable=True)
+            vals = vals[:topk]
+            argsort = argsort[:topk]
+        else:
+            vals, argsort = torch.topk(v.abs(), topk, sorted=True)
+
+        P = torch.zeros((topk, v.numel()), dtype=v.dtype, device=v.device)
+        P[range(topk), argsort] = 1.0
+        P = P.T
+
+        if self.P is None or self.beta is None or self.beta == 0:
+            self.P = P
+            self.vals = vals
+        else:
+            self.P.lerp_(P, 1-self.beta)
+            vals = self.vals.lerp_(vals, 1-self.beta)
+
+            P = orthogonalize(self.P, method=self.ortho_method)
+            if self.track_ortho: self.P = P
+
+        return P, P, vals, vals
+
+class ImportanceSampling(Basis):
+    """same as topk but doesn't just select top k elements, it selects random elements with probability based on their magnitude"""
+    def __init__(
+        self,
+        rank: int = 100,
+        beta: float | None = 0.99,
+        importance_fn = torch.abs,
+        ortho_method: OrthoMethod = 'qr',
+        track_ortho: bool = False
+    ):
+        super().__init__()
+        self.rank = rank
+        self.beta = beta
+        self.importance_fn = importance_fn
+        self.ortho_method: OrthoMethod = ortho_method
+        self.track_ortho = track_ortho
+        self.P = None
+
+    def update(self, Y, Z, alpha):
+        assert Z is None, "TopKPermutationBasis only works on symmetric matrices, set `symmetrize=True` in LRE"
+
+        v = Y.mean(1)
+        m = v.numel()
+        rank = min(self.rank, m)
+
+        importance = self.importance_fn(v) + torch.finfo(v.dtype).tiny * 2
+
+        # probabilities
+        # stupid numpy keeps whining that they don't sum to 1
+        # due to float precision so have to convert to numpy here
+        p = importance.numpy(force=True)
+        p = p / p.sum()
+
+        # select random indices based on probabilities (note abs is needed because apparently minus 0 is negative)
+        indices = torch.as_tensor(np.random.choice(m, size=rank, replace=False, p=p), device=v.device)
+        indices, _ = torch.sort(indices)
+
+        P = torch.zeros((rank, v.numel()), dtype=v.dtype, device=v.device)
+        P[range(rank), indices] = 1.0
+        P = P.T
+
+        if self.P is None or self.beta is None or self.beta == 0:
+            self.P = P
+
+        else:
+            self.P.lerp_(P, 1-self.beta)
+
+            P = orthogonalize(self.P, method=self.ortho_method)
+            if self.track_ortho: self.P = P
+
+        return P, P, None, None
+
+
+
+class HistogramSketching(Basis):
+    """this tries to "clump" similar values together in the subspace"""
+    def __init__(
+        self,
+        rank: int = 100,
+        beta: float | None = 0.99,
+        ortho_method: OrthoMethod = 'qr',
+        track_ortho: bool = False,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.beta = beta
+        self.track_ortho = track_ortho
+        self.Q = None
+        self.ortho_method: OrthoMethod = ortho_method
+
+    def update(self, Y, Z, alpha):
+        assert Z is None, "TopKPermutationBasis only works on symmetric matrices, set `symmetrize=True` in LRE"
+
+        v = Y.mean(1)
+        m = v.shape[0]
+        rank = min(self.rank, m)
+
+        vmin = v.min()
+        vmax = v.max()
+        vmin, vmax = torch.min(v), torch.max(v)
+
+        bin_width = (vmax - vmin) / rank
+        bin_indices = ((v - vmin) / bin_width).floor().long()
+
+        bin_indices = torch.clamp(bin_indices, 0, rank - 1)
+
+        S = torch.nn.functional.one_hot(bin_indices, num_classes=rank).float() # pylint:disable=not-callable
+
+        norms = torch.linalg.vector_norm(S, dim=0) # pylint:disable=not-callable
+        norms[norms == 0] = 1.0
+        Q = S / norms
+
+        if self.Q is None or self.beta is None or self.beta == 0:
+            self.Q = Q
+
+        else:
+            self.Q.lerp_(Q, 1-self.beta)
+
+            Q = orthogonalize(self.Q, method=self.ortho_method)
+            if self.track_ortho: self.Q = Q
+
+        return Q, Q, None, None

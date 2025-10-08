@@ -4,11 +4,14 @@ from collections.abc import Callable, Sequence
 from typing import Protocol
 
 import torch
+from torch.nn import functional as F
 
 from .basis import Basis
-from .opt import BasisOptimizer, Chain
 from .curvature import Curvature
+from .opt import BasisOptimizer, Chain
 
+_PRINT_ORTHOGONALITY = False
+"""prints mse(Q^T Q, I) on each step to debug stuff"""
 
 def vec_to_tensors(vec: torch.Tensor, reference: list[torch.Tensor]) -> list[torch.Tensor]:
     tensors = []
@@ -123,6 +126,10 @@ class LRE(torch.optim.Optimizer):
                 if Q is not None:
                     self.Q = Q
                     self.L = L
+
+                    if _PRINT_ORTHOGONALITY:
+                        I = torch.eye(Q.size(1), device=Q.device, dtype=Q.dtype)
+                        print(f'{F.mse_loss(Q.T @ Q, I) = }')
 
                 # reproject inner optimizer to new regularized basis
                 if Q_reg is not None:
