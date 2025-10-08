@@ -42,7 +42,7 @@ We have: current curvature matrix (e.g. covariance, hessian) stored as truncated
 
 ### Basis algorithms
 
-1. GGT from <https://arxiv.org/pdf/1806.02958> - this explicitly stores a history of last ``history_size`` corrections and computes $Q$ and $L$ via eigendecomposition of ``history_size x history_size`` matrix. In the paper they only used gradients (for covariance), but other curvatures can be used too by maintainting history of corrections.
+1. GGT from <https://arxiv.org/pdf/1806.02958> - this explicitly stores a history of last ``history_size`` corrections and computes $Q$ and $L$ via eigendecomposition of ``history_size x history_size`` matrix. In the paper they only used gradients (for covariance), but other curvatures can be used too by maintainting history of corrections. Note that GGT becomes significantly more expensive with SR1 and BFGS curvatures because they use signs (i.e. they can subtract $u u^T$), and that requires a QR.
 
 2. Direct eigendecomposition - as I said low rank correction to truncated eigendecomposition can be computed by eigendecomposition of $rank \times rank$ matrix, so same computational complexity as GGT. Unlike GGT this can be used to maintain exponential moving average of curvature matrix which may be useful.
 
