@@ -8,7 +8,7 @@ Now what if we store covariance matrix as truncated eigendecomposition - $Q L Q^
 
 Furthermore, this method naturally extends to other curvature matrices, for example quasi-newton methods also add rank-1 or rank-2 correction to the hessian approximation, so we use the same exact algorithm.
 
-So the algorithm maintains some curvature matrix as a low rank eigenbasis $Q L Q^T$. Specifically here $Q$ is an semi-orthogonal (semi because rank is truncated, {Q Q^T g \approx g}) rotation matrix which rotates curvature (e.g. covariance, hessian) to be diagonal. Now similar to how SOAP runs Adam in Shampoo's eigenbases, we can run some optimizer in our low rank eigebasis, except our basis is $rank$-dimensional making it possible to run expensive methods like full-matrix Adam or BFGS. Although since the basis is diagonalized, it is not clear if full-matrix methods are particularly useful here. Diagonal methods get rid of most of the variance as it is already mostly diagonal.
+So the algorithm maintains some curvature matrix as a low rank eigenbasis $Q L Q^T$. Specifically here $Q$ is an semi-orthogonal (semi because rank is truncated, $Q Q^T g \approx g$) rotation matrix which rotates curvature (e.g. covariance, hessian) to be diagonal. Now similar to how SOAP runs Adam in Shampoo's eigenbases, we can run some optimizer in our low rank eigebasis, except our basis is $rank$-dimensional making it possible to run expensive methods like full-matrix Adam or BFGS. Although since the basis is diagonalized, it is not clear if full-matrix methods are particularly useful here. Diagonal methods get rid of most of the variance as it is already mostly diagonal.
 
 ## The algorithm
 
