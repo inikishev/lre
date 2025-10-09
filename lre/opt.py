@@ -435,13 +435,13 @@ class FullMatrixAdam(BasisOptimizer):
         if self.exp_avg is not None:
             self.exp_avg = C @ self.exp_avg
 
-        if self.covariance is not None:
-            self.covariance = C @ self.covariance @ C.T
-
         if self.max_covariance_diag is not None:
             assert self.covariance is not None
             amsgrad_covariance = self.covariance.diagonal_scatter(self.max_covariance_diag)
             self.max_covariance_diag = (C @ amsgrad_covariance @ C.T).diagonal()
+
+        if self.covariance is not None:
+            self.covariance = C @ self.covariance @ C.T
 
         self.Q = Q
 
@@ -501,7 +501,7 @@ class FullMatrixAdam(BasisOptimizer):
 
 class HutchinsonAdam(BasisOptimizer):
     """Adam with squared exponential average replaced by exponential average of hutchinson hessian estimates. So this is SophiaH if ``square=False`` or AdaHessian if ``square=True``. This can only be used with Curvatures that use hessian-vector products."""
-    def __init__(self, beta1=0.9, beta2=0.99, eps=1e-8, amsgrad_beta=None, square:bool=False, zHz: bool = True):
+    def __init__(self, beta1=0.9, beta2=0.99, eps=1e-8, amsgrad_beta=None, square:bool=True, zHz: bool = True):
         self.beta1 = beta1
         self.beta2 = beta2
         self.eps = eps
@@ -529,10 +529,12 @@ class HutchinsonAdam(BasisOptimizer):
             self.exp_avg = C @ self.exp_avg
 
         if self.D_avg is not None:
-            self.D_avg = (C @ self.D_avg.diag_embed() @ C.T).diagonal()
+            if self.square: self.D_avg = (C @ self.D_avg.diag_embed() @ C.T).diagonal()
+            else: self.D_avg = C @ self.D_avg
 
         if self.max_D_avg is not None:
-            self.max_D_avg = (C @ self.max_D_avg.diag_embed() @ C.T).diagonal()
+            if self.square: self.max_D_avg = (C @ self.max_D_avg.diag_embed() @ C.T).diagonal()
+            else: self.D_avg = C @ self.max_D_avg
 
         self.Q = Q
 
@@ -627,7 +629,6 @@ class FullMatrixHutchinsonAdam(BasisOptimizer):
         C = Q.T @ self.Q
         if self.exp_avg is not None:
             self.exp_avg = C @ self.exp_avg
-
 
         if self.max_H_diag is not None:
             assert self.H_avg is not None
@@ -760,13 +761,13 @@ class FullMatrixBFGSAdam(BasisOptimizer):
         if self.exp_avg is not None:
             self.exp_avg = C @ self.exp_avg
 
-        if self.B_avg is not None:
-            self.B_avg = C @ self.B_avg @ C.T
-
         if self.max_B_diag is not None:
             assert self.B_avg is not None
             amsgrad_B = self.B_avg.diagonal_scatter(self.max_B_diag)
             self.max_B_diag = (C @ amsgrad_B @ C.T).diagonal()
+
+        if self.B_avg is not None:
+            self.B_avg = C @ self.B_avg @ C.T
 
         self.Q = Q
 

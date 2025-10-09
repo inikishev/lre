@@ -224,7 +224,7 @@ class Eigen(Basis):
 
         ortho_method: OrthoMethod = "qr",
         reortho_method: OrthoMethod = "qr",
-        reortho_threshold: float = 1,
+        reortho_threshold: float = 0.1,
 
     ):
         self.Q = None
@@ -718,7 +718,7 @@ class HebbianLearning(Basis):
 
 
 class Random(Basis):
-    """random basis"""
+    """random basis, good for testing reprojections"""
     def __init__(self, rank=100, generate_freq:int=1):
         super().__init__()
         self.rank = rank
@@ -731,6 +731,23 @@ class Random(Basis):
             self.Q = orthogonalize(torch.randn([Y.size(0), self.rank], device=Y.device, dtype=Y.dtype), 'qr')
 
         return self.Q, self.Q, None, None
+
+class RandomPermutation(Basis):
+    """random permutation basis, i.e. selects rank rows"""
+    def __init__(self, rank=100):
+        super().__init__()
+        self.rank = rank
+
+    def update(self, Y, Z, alpha):
+        ndim, _ = Y.shape
+        rank = min(ndim, self.rank)
+        weights = torch.ones(ndim, dtype=Y.dtype, device=Y.device)
+        indices = torch.multinomial(weights, rank, replacement=False)
+
+        P = torch.zeros(ndim, rank)
+        P[indices, range(rank)] = 1
+        return P, P, None, None
+
 
 class FullMatrix(Basis):
     """Full-matrix basis. Stores full matrix and computes eigendecomposition on each update"""
@@ -779,7 +796,7 @@ class TopK(Basis):
     def __init__(
         self,
         topk: int = 100,
-        beta: float | None = 0.99,
+        beta: float | None = 0,
         stable: bool = False,
         ortho_method: OrthoMethod = 'qr',
         track_ortho: bool = False,
@@ -799,7 +816,8 @@ class TopK(Basis):
         topk = min(self.topk, v.numel())
 
         if self.stable:
-            vals, argsort = torch.sort(v.abs(), descending=True, stable=True)
+            # vals are to try to use them
+            vals, argsort = torch.argsort(v.abs(), descending=True, stable=True)
             vals = vals[:topk]
             argsort = argsort[:topk]
         else:
@@ -826,7 +844,7 @@ class ImportanceSampling(Basis):
     def __init__(
         self,
         rank: int = 100,
-        beta: float | None = 0.99,
+        beta: float | None = 0,
         importance_fn = torch.abs,
         ortho_method: OrthoMethod = 'qr',
         track_ortho: bool = False
@@ -880,7 +898,7 @@ class HistogramSketching(Basis):
     def __init__(
         self,
         rank: int = 100,
-        beta: float | None = 0.99,
+        beta: float | None = 0,
         ortho_method: OrthoMethod = 'qr',
         track_ortho: bool = False,
     ):
@@ -923,3 +941,57 @@ class HistogramSketching(Basis):
             if self.track_ortho: self.Q = Q
 
         return Q, Q, None, None
+
+class CommonDirections(Basis):
+    """Returns an orthogonal basis made of correction vectors as described in https://jmlr.org/papers/volume20/16-309/16-309.pdf (where it is made of steepest descent directions)"""
+    def __init__(
+        self,
+        rank: int = 100,
+        use_mgs: bool = True,
+        reortho_method: OrthoMethod = "qr",
+        reortho_threshold: float = 0.1,
+    ):
+        super().__init__()
+        self.rank = rank
+        self.history = deque(maxlen=rank)
+        self.use_mgs = use_mgs
+
+        self.reortho_method: OrthoMethod = reortho_method
+        self.reortho_threshold = reortho_threshold
+
+    def update(self, Y, Z, alpha):
+        assert Z is None, "CommonDirections only works on symmetric matrices, set `symmetrize=True` in LRE"
+
+        if self.history: S = torch.stack(tuple(self.history), dim=1)
+        else: S = None
+
+        for g in Y.unbind(1):
+            p = g.clone() # Start with the original vector
+
+            if S is not None:
+                if self.use_mgs:
+                    for i in range(S.size(1)):
+                        s_i = S[:, i]
+                        p -= p.dot(s_i) * s_i
+                else:
+                    p -= S @ (S.T @ g)
+
+            p_norm = torch.linalg.vector_norm(p) # pylint:disable=not-callable
+
+            if p_norm > torch.finfo(p.dtype).tiny * 2:
+                p /= p_norm
+                self.history.append(p)
+
+                if S is None:
+                    S = p.unsqueeze(1)
+                else:
+                    S = torch.cat([S, p.unsqueeze(1)], dim=1)
+
+        assert S is not None
+        StS = S.T @ S
+        I = torch.eye(StS.size(0), device=StS.device, dtype=StS.dtype)
+        if torch.nn.functional.mse_loss(StS, I) > self.reortho_threshold:
+            S = orthogonalize(S, method=self.reortho_method)
+            self.history.extend(S.unbind(1)) # replace history with orthogonal
+
+        return S, S, None, None
