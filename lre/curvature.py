@@ -760,3 +760,110 @@ class ShorRGradient(Curvature):
         C, sign = shor_r(Q, L, y.unsqueeze(1), alpha=self.alpha)
 
         return C, None, torch.tensor(sign, device=C.device, dtype=C.dtype)
+
+
+
+class EMA(Curvature):
+    """EMA of gradients, same as momentum into preconditioner
+    """
+    def __init__(self, beta=0.9):
+        self.history = []
+        self.exp_avg = None
+        self.beta = beta
+
+    def initialize(self, grad, state):
+        Y = torch.stack(self.history, 1)
+        L, Q = low_rank_eigh(Y)
+        return Q, L
+
+    def update(self, loss, grad, closure, params_list, should_update, Q, L):
+        if grad is None:
+            with torch.enable_grad():
+                if loss is None:
+                    loss = closure()
+                else:
+                    for p in params_list: p.grad = None
+                    loss.backward()
+            grad = _cat_grads(params_list)
+
+        if self.exp_avg is None: self.exp_avg = grad
+        else: self.exp_avg.lerp_(grad, 1-self.beta)
+
+        self.history.append(self.exp_avg.clone())
+        assert loss is not None
+        return loss, grad, {}
+
+    def compute_correction(self, Q, L):
+        Y = torch.stack(self.history, 1)
+        self.history.clear()
+        return Y, None, torch.tensor(1., device=Y.device, dtype=Y.dtype)
+
+
+
+class Parameters(Curvature):
+    """returns parameters. This corresponds to empirical covariance of parameters
+    """
+    def __init__(self):
+        self.history = []
+
+    def initialize(self, grad, state):
+        Y = torch.stack(self.history, 1)
+        L, Q = low_rank_eigh(Y)
+        return Q, L
+
+    def update(self, loss, grad, closure, params_list, should_update, Q, L):
+        if grad is None:
+            with torch.enable_grad():
+                if loss is None:
+                    loss = closure()
+                else:
+                    for p in params_list: p.grad = None
+                    loss.backward()
+            grad = _cat_grads(params_list)
+
+        self.history.append(_cat_tensors(params_list))
+        assert loss is not None
+        return loss, grad, {}
+
+    def compute_correction(self, Q, L):
+        Y = torch.stack(self.history, 1)
+        self.history.clear()
+        return Y, None, torch.tensor(1., device=Y.device, dtype=Y.dtype)
+
+class Update(Curvature):
+    """returns previous update. This corresponds to empirical covariance of past (already preconditioned) updates
+    """
+    def __init__(self):
+        self.history = []
+        self.p_prev = None
+
+    def initialize(self, grad, state):
+        Y = torch.stack(self.history, 1)
+        L, Q = low_rank_eigh(Y)
+        return Q, L
+
+    def update(self, loss, grad, closure, params_list, should_update, Q, L):
+        if grad is None:
+            with torch.enable_grad():
+                if loss is None:
+                    loss = closure()
+                else:
+                    for p in params_list: p.grad = None
+                    loss.backward()
+            grad = _cat_grads(params_list)
+
+        p = _cat_tensors(params_list)
+        if self.p_prev is None:
+            self.p_prev = p
+        else:
+            s = p - self.p_prev
+            self.p_prev = p
+            self.history.append(s)
+
+        assert loss is not None
+        return loss, grad, {}
+
+    def compute_correction(self, Q, L):
+        Y = torch.stack(self.history, 1)
+        self.history.clear()
+        return Y, None, torch.tensor(1., device=Y.device, dtype=Y.dtype)

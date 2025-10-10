@@ -3,6 +3,8 @@ import math
 from abc import ABC, abstractmethod
 from collections import deque
 from collections.abc import Callable
+from typing import Literal
+
 import numpy as np
 import torch
 
@@ -249,7 +251,7 @@ class Eigen(Basis):
         self.current_step = 0
 
     def update(self, Y, Z, alpha):
-        self.current_step += 1
+        self.current_step += Y.size(1)
 
         # initialize on 1st step
         if self.Q is None or self.L is None:
@@ -402,7 +404,7 @@ class RandomizedEigen(Basis):
     def update(self, Y, Z, alpha):
         assert Z is None, "Randomized eigen only works on symmetric matrices, set `symmetrize=True` in LRE"
 
-        self.current_step += 1
+        self.current_step += Y.size(1)
 
         # initialize on 1st step
         if self.Q is None or self.L is None:
@@ -566,7 +568,7 @@ class Nystrom(Basis):
     def update(self, Y, Z, alpha):
         assert Z is None, "Randomized eigen only works on symmetric matrices, set `symmetrize=True` in LRE"
 
-        self.current_step += 1
+        self.current_step += Y.size(1)
 
         # initialize on 1st step
         if self.Q is None or self.L is None:
@@ -692,7 +694,7 @@ class HebbianLearning(Basis):
 
     def update(self, Y, Z, alpha):
         assert Z is None, "HebbianLearning only works on symmetric matrices, set `symmetrize=True` in LRE"
-        self.current_step += 1
+        self.current_step += Y.size(1)
 
         # initialize Q on 1st step
         if self.Q is None:
@@ -812,7 +814,7 @@ class TopK(Basis):
     def update(self, Y, Z, alpha):
         assert Z is None, "TopKPermutationBasis only works on symmetric matrices, set `symmetrize=True` in LRE"
 
-        v = Y.mean(1)
+        v = Y.amax(1)
         topk = min(self.topk, v.numel())
 
         if self.stable:
@@ -839,7 +841,7 @@ class TopK(Basis):
 
         return P, P, vals, vals
 
-class ImportanceSampling(Basis):
+class WeightedPermutation(Basis):
     """same as topk but doesn't just select top k elements, it selects random elements with probability based on their magnitude"""
     def __init__(
         self,
@@ -860,11 +862,9 @@ class ImportanceSampling(Basis):
     def update(self, Y, Z, alpha):
         assert Z is None, "TopKPermutationBasis only works on symmetric matrices, set `symmetrize=True` in LRE"
 
-        v = Y.mean(1)
-        m = v.numel()
+        importance = self.importance_fn(Y).amax(1) + torch.finfo(Y.dtype).tiny * 2
+        m = importance.numel()
         rank = min(self.rank, m)
-
-        importance = self.importance_fn(v) + torch.finfo(v.dtype).tiny * 2
 
         # probabilities
         # stupid numpy keeps whining that they don't sum to 1
@@ -873,10 +873,10 @@ class ImportanceSampling(Basis):
         p = p / p.sum()
 
         # select random indices based on probabilities (note abs is needed because apparently minus 0 is negative)
-        indices = torch.as_tensor(np.random.choice(m, size=rank, replace=False, p=p), device=v.device)
+        indices = torch.as_tensor(np.random.choice(m, size=rank, replace=False, p=p), device=importance.device)
         indices, _ = torch.sort(indices)
 
-        P = torch.zeros((rank, v.numel()), dtype=v.dtype, device=v.device)
+        P = torch.zeros((rank, importance.numel()), dtype=importance.dtype, device=importance.device)
         P[range(rank), indices] = 1.0
         P = P.T
 
@@ -893,8 +893,8 @@ class ImportanceSampling(Basis):
 
 
 
-class HistogramSketching(Basis):
-    """this tries to "clump" similar values together in the subspace"""
+class Histogram(Basis):
+    """clumps similar values together"""
     def __init__(
         self,
         rank: int = 100,
@@ -995,3 +995,94 @@ class CommonDirections(Basis):
             self.history.extend(S.unbind(1)) # replace history with orthogonal
 
         return S, S, None, None
+
+
+class LowRank(Basis):
+    """GGT but with decay and MUCH BETTER alphas, only one eigen per update, plus experimental drop smallest"""
+    def __init__(
+        self,
+        rank=100,
+        beta=0.99,
+
+        eig_tol: float = 1e-4,
+        damping: float = 0,
+        rdamping: float = 0,
+        abs: bool = False,
+
+        update_truncate: int | None = None,
+        update_eig_tol: float | None = None,
+        update_damping: float = 1e-4,
+        update_rdamping: float = 0,
+        update_abs: bool = False,
+
+        drop_strat: Literal["reconstruct", "drop_oldest", "drop_smallest"] = "reconstruct",
+    ):
+        super().__init__()
+        self.rank = rank
+        self.beta = beta
+
+        self.eig_tol = eig_tol
+        self.damping = damping
+        self.rdamping = rdamping
+        self.abs = abs
+
+        self.update_truncate = update_truncate
+        self.update_eig_tol = update_eig_tol
+        self.update_damping = update_damping
+        self.update_rdamping = update_rdamping
+        self.update_abs = update_abs
+
+        self.drop_strat = drop_strat
+        self.U = None
+        self.current_step = 0
+
+    def update(self, Y, Z, alpha):
+        self.current_step += Y.size(0)
+        if Z is None: Z = Y
+
+        if not isinstance(alpha, torch.Tensor): alpha = torch.tensor(alpha, device=Y.device, dtype=Y.dtype)
+        alpha = torch.broadcast_to(alpha, [Y.size(1)])
+
+        if self.U is None:
+            self.U = torch.zeros(Y.size(0), 0, device=Y.device, dtype=Y.dtype)
+
+        self.U.mul_(self.beta)
+        A = torch.cat((self.U, Y * (1 - self.beta)), dim=1)
+        B = torch.cat((self.U, Z * alpha * (1 - self.beta)), dim=1)
+
+        self.U = A.add_(B).div_(2)
+
+        if self.U.size(1) > self.rank:
+
+            if self.drop_strat == "drop_oldest":
+                self.U = self.U[:, self.U.size(1)-self.rank:]
+
+            elif self.drop_strat == "drop_smallest":
+                norms, _ = self.U.norm(dim=0).sort()
+                kth = norms[-self.rank]
+                self.U = self.U[:, norms >= kth]
+
+        # dedias
+        bias_correction = (1 - self.beta ** self.current_step)
+        if self.drop_strat == "reconstruct":
+            # eigen
+            L, Q = low_rank_eigh(self.U)
+            # first round of reg
+            L, Q = regularize_eigh(L, Q, truncate=None, tol=self.eig_tol, damping=self.damping, rdamping=self.rdamping)
+            if L is None or Q is None: return None, None, None, None
+
+            self.U = Q @ L.abs().sqrt().diag_embed()
+            L /= bias_correction
+
+        else:
+            U = self.U / bias_correction
+            L, Q = low_rank_eigh(U)
+            # first round of reg
+            L, Q = regularize_eigh(L, Q, truncate=None, tol=self.eig_tol, damping=self.damping, rdamping=self.rdamping)
+            if L is None or Q is None: return None, None, None, None
+
+        # scond round of reg
+        L_reg, Q_reg = regularize_eigh(L, Q, truncate=self.update_truncate, tol=self.update_eig_tol, damping=self.update_damping, rdamping=self.update_rdamping)
+        if L_reg is None or Q_reg is None: return None, None, None, None
+
+        return Q, Q_reg, L, L_reg
